@@ -1,0 +1,7 @@
+# Q-learning with higher learning rate, for hyperparameter sweep.
+agent:
+  alpha: 0.9
+  gamma: 0.99
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_episodes: 2000

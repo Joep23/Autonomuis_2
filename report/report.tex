@@ -1,0 +1,568 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[dutch]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black
+}
+
+\title{\textbf{Tabular Reinforcement Learning op Taxi-v3} \\
+       \large Een vergelijking van Q-learning en SARSA tegen baselines}
+\author{Karol Gackowski \and Joep Houweling}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+We onderzoeken in welke mate twee klassieke tabulaire Reinforcement
+Learning algoritmen --- Q-learning en SARSA --- de Taxi-v3 omgeving uit
+Gymnasium kunnen oplossen. Beide algoritmen zijn vanaf nul ge\"implementeerd
+in NumPy, getraind op 3000 episodes en vergeleken met een uniform-random
+baseline en een Manhattan-shortest-path heuristiek die geen kennis heeft
+van muren. Q-learning bereikt een gemiddeld rendement van $+8{,}33$ met
+$100\%$ succesvolle leveringen; SARSA $-2{,}32$ met $95\%$ succes. Beide
+verslaan ruimschoots de heuristiek ($-156$, $21\%$) en de random baseline
+($-748$, $6\%$). Hyperparameter-sweeps over $\alpha$, $\gamma$ en het
+$\varepsilon$-decay-schema laten zien dat Q-learning robuust is voor
+$\alpha$ en $\gamma$, maar gevoelig is voor te trage $\varepsilon$-decay,
+terwijl SARSA bij hoge $\alpha$ catastrofaal instort vanwege de
+on-policy bootstrap. We koppelen deze bevindingen terug aan de theorie en
+bespreken de beperkingen van tabulaire methoden.
+\end{abstract}
+
+\section{Introductie}
+
+Reinforcement Learning (RL) bestudeert hoe een autonome agent door
+interactie met een omgeving een gedragsstrategie kan leren die de
+verwachte cumulatieve beloning maximaliseert
+\cite{sutton_barto_2018}. In tegenstelling tot supervised learning is er
+geen vooraf gegeven dataset met correcte acties; de agent ontdekt zelf
+welke acties op de lange termijn lonend zijn via trial-and-error.
+
+Voor deze portfolio-opdracht hebben wij gekozen voor de \emph{Taxi}
+omgeving, oorspronkelijk geformaliseerd door
+\citet{dietterich_2000} en tegenwoordig opgenomen als
+\texttt{Taxi-v3} in de Gymnasium-suite \cite{towers_2024}. De agent
+bestuurt een taxi op een $5 \times 5$ raster met muren, moet een
+passagier ophalen op \'e\'en van vier vaste lokaties en deze afleveren op
+een eveneens vooraf bepaalde bestemming. Elke stap kost \'e\'en
+beloningseenheid; een illegale pickup of dropoff kost tien; een
+succesvolle aflevering levert twintig op.
+
+\paragraph{Waarom RL geschikt is.}
+Drie eigenschappen maken Taxi-v3 een natuurlijk doelwit voor RL en
+ongeschikt voor supervised of regelgebaseerde alternatieven:
+
+\begin{enumerate}
+  \item \textbf{Geen gelabelde dataset.} Er bestaat geen verzameling
+        ``correcte'' acties per toestand om uit te leren; de agent moet
+        zelf experimenteren.
+  \item \textbf{Lange-termijn credit-assignment.} De $+20$ beloning bij
+        aflevering moet teruggekoppeld worden naar de tientallen acties
+        die er aan vooraf gingen. Een hand-gecodeerde Manhattan-heuristiek
+        kan dit niet, want zij ``ziet'' geen muren en raakt vaak vast
+        (zie sectie~\ref{sec:results}).
+  \item \textbf{Gestructureerde sub-taken.} De optimale strategie hangt
+        af van of de passagier al in de taxi zit. Een statische heuristiek
+        moet deze logica expliciet coderen; RL leert dit impliciet via
+        de toestandsafhankelijkheid van $Q(s,a)$.
+\end{enumerate}
+
+\paragraph{Onderzoeksvragen.} Dit rapport beantwoordt:
+(i) hoe presteren Q-learning en SARSA, vanuit nul ge\"implementeerd, op
+Taxi-v3 ten opzichte van een random- en een heuristische baseline?
+(ii) hoe gevoelig zijn beide algoritmen voor de keuze van $\alpha$,
+$\gamma$ en het $\varepsilon$-decay-schema?
+(iii) welke kwalitatieve verschillen tussen on-policy (SARSA) en
+off-policy (Q-learning) leren observeren we in dit domein?
+
+\section{Probleemdefinitie en MDP}
+\label{sec:mdp}
+
+Taxi-v3 wordt gemodelleerd als een Markov Decision Process (MDP)
+$\langle \mathcal{S}, \mathcal{A}, P, R, \gamma \rangle$ met de
+volgende elementen:
+
+\paragraph{Toestandsruimte $\mathcal{S}$.}
+$|\mathcal{S}| = 500$ discrete toestanden, gecodeerd als
+\begin{equation}
+  s = \bigl((r \cdot 5 + c) \cdot 5 + p\bigr) \cdot 4 + d,
+\end{equation}
+waarbij $r, c \in \{0,\dots,4\}$ de positie van de taxi zijn,
+$p \in \{0,\dots,4\}$ de locatie van de passagier (0=R, 1=G, 2=Y,
+3=B, 4=in\_taxi) en $d \in \{0,\dots,3\}$ de bestemming.
+
+\paragraph{Actieruimte $\mathcal{A}$.}
+$|\mathcal{A}| = 6$: \{south, north, east, west, pickup, dropoff\}.
+Bewegingsacties die tegen een muur of de rand bewegen, laten de agent
+op zijn plaats. Pickup en dropoff buiten een geldige locatie zijn
+toegestaan maar kosten beloning.
+
+\paragraph{Belonings\-functie $R$.}
+$-1$ per stap, $-10$ voor een illegale pickup of dropoff,
+$+20$ voor een succesvolle aflevering (terminale beloning).
+
+\paragraph{Discount $\gamma$.}
+We gebruiken $\gamma = 0{,}99$ als basis. Omdat de episodes terminaal
+zijn na succesvolle aflevering, is $\gamma$ vooral een knop voor de
+``urgentie'' waarmee de agent wil dat de aflevering snel gebeurt.
+
+\section{Methode}
+\label{sec:method}
+
+\subsection{Algoritmen}
+
+\paragraph{Q-learning (off-policy)} \cite{watkins_dayan_1992}
+schat de actie-waardefunctie $Q(s,a)$ met de update-regel
+\begin{equation}
+  Q(s_t, a_t) \leftarrow Q(s_t, a_t) + \alpha
+    \bigl[ r_{t+1} + \gamma \max_{a'} Q(s_{t+1}, a') - Q(s_t, a_t) \bigr].
+  \label{eq:qlearning}
+\end{equation}
+Het bootstrap-target gebruikt de \emph{greedy} actie in $s_{t+1}$,
+ongeacht welke actie de gedragspolitiek (hier $\varepsilon$-greedy)
+werkelijk gaat selecteren. Daarmee leert Q-learning de optimale
+greedy-policy, ook als de gedragspolitiek nog veel exploratie bevat.
+
+\paragraph{SARSA (on-policy)} \cite{rummery_niranjan_1994}
+bootstrappt met de actie die de gedragspolitiek \emph{daadwerkelijk}
+selecteert:
+\begin{equation}
+  Q(s_t, a_t) \leftarrow Q(s_t, a_t) + \alpha
+    \bigl[ r_{t+1} + \gamma\, Q(s_{t+1}, a_{t+1}) - Q(s_t, a_t) \bigr].
+  \label{eq:sarsa}
+\end{equation}
+Daardoor incorporeert SARSA de exploratie-ruis in zijn waardeschatting:
+de geleerde policy is optimaal \emph{gegeven} dat de gedragspolitiek
+$\varepsilon$-greedy blijft.
+
+\paragraph{Implementatie.} Beide algoritmen zijn als puur Python
+ge\"implementeerd, met de Q-tabel als een
+$|\mathcal{S}| \times |\mathcal{A}|$ NumPy-array. We gebruiken
+$\varepsilon$-greedy actie-selectie met willekeurige tie-breaking in de
+greedy stap, en lineaire $\varepsilon$-decay van $1{,}0$ naar $0{,}05$
+over 2000 episodes. Geen enkele RL-bibliotheek (Stable-Baselines, RLlib,
+e.d.) is gebruikt; we voldoen daarmee aan de eis dat de algoritmen
+vanaf nul ge\"implementeerd zijn.
+
+\subsection{Baselines}
+
+\paragraph{Random.} Uniforme keuze uit de zes acties. Dient als
+ondergrens.
+
+\paragraph{Heuristiek.} Een Manhattan-shortest-path strategie die
+geen kennis heeft van muren:
+\begin{itemize}
+  \item Als de passagier nog niet in de taxi zit: ga naar de pickup-tegel
+        via de actie die de Manhattan-afstand het meest verkleint; voer
+        \texttt{pickup} uit zodra je er bent.
+  \item Anders: ga naar de bestemmingstegel via dezelfde regel; voer
+        \texttt{dropoff} uit zodra je er bent.
+\end{itemize}
+Door de muren niet te kennen, loopt de agent regelmatig vast.
+
+\subsection{Hyperparameter-experimenten}
+
+We voeren vier sweeps uit, telkens met vijf seeds per waarde en
+3000 episodes per run:
+
+\begin{enumerate}
+  \item \textbf{Q-learning, $\alpha \in \{0{,}1, 0{,}3, 0{,}5, 0{,}9\}$}
+        --- gevoeligheid voor de leersnelheid.
+  \item \textbf{Q-learning, $\gamma \in \{0{,}8, 0{,}9, 0{,}95, 0{,}99\}$}
+        --- gevoeligheid voor de horizon.
+  \item \textbf{Q-learning, $\varepsilon$-decay-episodes
+        $\in \{200, 1000, 2000, 5000\}$}
+        --- gevoeligheid voor het exploratie-schema.
+  \item \textbf{SARSA, $\alpha \in \{0{,}1, 0{,}3, 0{,}5, 0{,}9\}$}
+        --- spiegel van sweep 1, om on-policy gedrag te isoleren.
+\end{enumerate}
+
+\subsection{Evaluatieprotocol}
+
+Na training worden agenten ge\"evalueerd over $100$ episodes met
+$\varepsilon = 0$ (puur greedy) en met seeds die niet overlappen met de
+trainingsseeds. We rapporteren gemiddeld rendement, gemiddelde
+episodelengte, gemiddeld aantal illegale acties en het
+afleveringspercentage.
+
+\section{Resultaten}
+\label{sec:results}
+
+\subsection{Hoofdvergelijking}
+
+Tabel~\ref{tab:main} toont de greedy-evaluatie van alle vier de agenten
+na 3000 trainings\-episodes. Beide RL-algoritmen verslaan de baselines
+ruimschoots; Q-learning bereikt de optimale prestatie ($100\%$ succes,
+gemiddelde episode-lengte $\approx 13$, in lijn met het theoretische
+optimum van ongeveer 12--14 stappen per episode), terwijl SARSA er net
+onder zit met $95\%$ succes. De wandblinde heuristiek presteert
+nauwelijks beter dan random ondanks haar doelgerichte ontwerp: zonder
+muur\-bewustzijn raakt zij in 79\% van de episodes verstrikt en haalt
+zij de tijdslimiet.
+
+\begin{table}[h]
+\centering
+\caption{Greedy evaluatie ($\varepsilon=0$) over 100 episodes.
+``Mean return'' is het gemiddelde gediscounteerde rendement;
+``Length'' is de gemiddelde episodelengte;
+``Success'' is het percentage episodes dat eindigt in een succesvolle
+aflevering.}
+\label{tab:main}
+\begin{tabular}{lrrrr}
+\toprule
+Agent & Mean return & Std & Mean length & Success rate \\
+\midrule
+Random            & $-748{,}47$ & $130{,}67$ & $193{,}9$ & $\phantom{0}6\%$ \\
+Heuristiek        & $-155{,}74$ & $\phantom{0}85{,}86$ & $160{,}2$ & $21\%$ \\
+SARSA             & $\phantom{-00}-2{,}32$ & $\phantom{0}45{,}45$ & $\phantom{0}22{,}3$ & $95\%$ \\
+\textbf{Q-learning} & $\phantom{-00}+\mathbf{8{,}33}$ & $\phantom{00}\mathbf{2{,}82}$ & $\phantom{0}\mathbf{12{,}7}$ & $\mathbf{100\%}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Trainingscurves}
+
+Figuur~\ref{fig:reward_curves} laat de leercurves van Q-learning en
+SARSA zien. Beide algoritmen vertonen het kenmerkende ``hockey-stick''
+patroon: een lange initi\"ele plateau waarin random exploratie weinig
+positief signaal oplevert, gevolgd door een snelle stijging zodra de
+agent de eerste succesvolle leveringen ervaart en het $+20$ signaal
+zich door de Q-tabel verspreidt. Q-learning convergeert iets sneller
+en eindigt op een hoger plateau dan SARSA, in lijn met het verschil in
+greedy-evaluatie uit Tabel~\ref{tab:main}.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{../results/reward_curves.png}
+\caption{Trainingscurves (rolling mean over 20 episodes) voor
+Q-learning en SARSA op Taxi-v3. De stippellijn geeft de theoretisch
+benaderde optimale return ($\approx +8$).}
+\label{fig:reward_curves}
+\end{figure}
+
+\subsection{Geleerde policies}
+
+Figuren~\ref{fig:policy_q} en~\ref{fig:policy_sarsa} visualiseren de
+greedy policies in acht (passagierslocatie, bestemming) configuraties.
+Voor elke configuratie tonen we $V(s) = \max_a Q(s,a)$ als heatmap
+met de greedy actie als pijl per cel; \texttt{P} en \texttt{D} markeren
+respectievelijk pickup- en dropoff-acties. De donkergroene gradient
+loopt logisch naar de oranje (passagier) of rode (bestemming) markering.
+De Q-learning policy is over alle scenario's stabiel coherent; SARSA's
+policy is grotendeels gelijk maar bevat enkele cellen met een suboptimale
+actie, wat het lagere succespercentage in Tabel~\ref{tab:main} verklaart.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{../results/qlearning_default/policy.png}
+\caption{Q-learning greedy policy in acht scenario's. Bovenste rij:
+passagier wacht bij \textbf{R} (oranje cirkel). Onderste rij: passagier
+zit al in de taxi. Kolommen: bestemming \textbf{R}, \textbf{G},
+\textbf{Y}, \textbf{B} (rood vierkant).}
+\label{fig:policy_q}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{../results/sarsa_default/policy.png}
+\caption{SARSA greedy policy, zelfde acht scenario's als
+Figuur~\ref{fig:policy_q}.}
+\label{fig:policy_sarsa}
+\end{figure}
+
+\subsection{Hyperparameter-sweeps}
+\label{sec:sweeps}
+
+Tabel~\ref{tab:sweeps} vat de gemiddelde return over de laatste 200
+training-episodes samen voor elke sweep, gemiddeld over vijf seeds.
+Figuren~\ref{fig:sweep_alpha}, \ref{fig:sweep_gamma},
+\ref{fig:sweep_eps} en~\ref{fig:sweep_sarsa_alpha} tonen de
+bijbehorende leercurves met $\pm 1\sigma$ banden.
+
+\begin{table}[h]
+\centering
+\caption{Gemiddelde return over de laatste 200 episodes per sweep
+(mean $\pm$ std over 5 seeds).}
+\label{tab:sweeps}
+\begin{tabular}{lll}
+\toprule
+Sweep & Waarde & Mean return (last 200) \\
+\midrule
+\multirow{4}{*}{Q-learning, $\alpha$}
+  & 0{,}1 & $+5{,}59 \pm 0{,}33$ \\
+  & 0{,}3 & $+5{,}91 \pm 0{,}21$ \\
+  & 0{,}5 & $+5{,}53 \pm 0{,}34$ \\
+  & 0{,}9 & $+5{,}62 \pm 0{,}19$ \\
+\midrule
+\multirow{4}{*}{Q-learning, $\gamma$}
+  & 0{,}8  & $+5{,}70 \pm 0{,}32$ \\
+  & 0{,}9  & $+5{,}57 \pm 0{,}36$ \\
+  & 0{,}95 & $+5{,}77 \pm 0{,}36$ \\
+  & 0{,}99 & $+5{,}53 \pm 0{,}34$ \\
+\midrule
+\multirow{4}{*}{Q-learning, $\varepsilon$-decay-eps.}
+  & 200  & $+5{,}30 \pm 0{,}22$ \\
+  & 1000 & $+5{,}24 \pm 0{,}30$ \\
+  & 2000 & $+5{,}53 \pm 0{,}34$ \\
+  & 5000 & $\mathbf{-35{,}27 \pm 1{,}18}$ \\
+\midrule
+\multirow{4}{*}{SARSA, $\alpha$}
+  & 0{,}1 & $+4{,}94 \pm 0{,}50$ \\
+  & 0{,}3 & $+5{,}10 \pm 0{,}26$ \\
+  & 0{,}5 & $+3{,}07 \pm 1{,}06$ \\
+  & 0{,}9 & $\mathbf{-56{,}36 \pm 6{,}46}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Q-learning, $\alpha$ (Fig.~\ref{fig:sweep_alpha}).}
+Q-learning is opvallend ongevoelig voor de leersnelheid: alle vier de
+waarden eindigen binnen $\pm 0{,}3$ van elkaar. Dit is consistent met
+de theoretische convergentiegarantie van Q-learning onder Robbins--Monro
+voorwaarden \cite{sutton_barto_2018}; in de praktijk geldt dat zolang
+$\alpha$ niet zo extreem laag is dat updates verwaarloosbaar worden,
+de eindwaardefunctie convergeert naar dezelfde fixed point.
+
+\paragraph{Q-learning, $\gamma$ (Fig.~\ref{fig:sweep_gamma}).}
+Vergelijkbaar robuust over de geteste range. Voor Taxi-v3 zijn episodes
+relatief kort (typisch $<20$ stappen na convergentie), waardoor het
+verschil tussen $\gamma=0{,}8$ en $\gamma=0{,}99$ in de praktijk klein
+blijft.
+
+\paragraph{Q-learning, $\varepsilon$-decay (Fig.~\ref{fig:sweep_eps}).}
+Hier vinden we de eerste duidelijke negatieve uitslag: bij een
+$\varepsilon$-decay-window van 5000 episodes is $\varepsilon$ na 3000
+training-episodes nog ruim boven $0{,}3$, zodat een aanzienlijk deel
+van de \emph{evaluatie}-stappen in de laatste 200 episodes nog
+willekeurig zijn. De return zakt dan naar $-35{,}27$. Dit illustreert
+een belangrijk praktisch punt: ook al levert Q-learning een correcte
+greedy-policy op, de gemeten trainings-return wordt sterk be\"invloed
+door de gedragspolitiek.
+
+\paragraph{SARSA, $\alpha$ (Fig.~\ref{fig:sweep_sarsa_alpha}).}
+Hier vinden we de meest dramatische bevinding: SARSA is veel
+gevoeliger voor $\alpha$ dan Q-learning. Bij $\alpha=0{,}9$ stort SARSA
+in tot een gemiddelde return van $-56{,}36$ met slechts $91{,}5\%$
+succes. De verklaring volgt uit vergelijking~\eqref{eq:sarsa}: bij
+hoge $\alpha$ slaat een enkele $\varepsilon$-greedy random actie met
+slechte uitkomst direct door in $Q(s_t, a_t)$ via de bootstrap
+$Q(s_{t+1}, a_{t+1})$ van diezelfde slechte actie. Q-learning is hier
+immuun voor, omdat zijn bootstrap altijd $\max_{a'} Q(s_{t+1}, a')$
+gebruikt --- de slechte actie wordt simpelweg buiten beschouwing
+gelaten.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{../results/sweep_qlearning_alpha/sweep_curves.png}
+\caption{Q-learning, sweep over $\alpha$. Mean $\pm 1\sigma$ over 5 seeds.}
+\label{fig:sweep_alpha}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{../results/sweep_qlearning_gamma/sweep_curves.png}
+\caption{Q-learning, sweep over $\gamma$.}
+\label{fig:sweep_gamma}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{../results/sweep_qlearning_epsilon_decay_episodes/sweep_curves.png}
+\caption{Q-learning, sweep over de lengte van het $\varepsilon$-decay-schema.
+Bij 5000 episodes blijft $\varepsilon$ tijdens de gehele training te hoog,
+met een dramatisch lagere trainings-return als gevolg.}
+\label{fig:sweep_eps}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{../results/sweep_sarsa_alpha/sweep_curves.png}
+\caption{SARSA, sweep over $\alpha$. In tegenstelling tot Q-learning
+(Fig.~\ref{fig:sweep_alpha}) stort SARSA bij hoge $\alpha$ in.}
+\label{fig:sweep_sarsa_alpha}
+\end{figure}
+
+\section{Discussie en reflectie}
+\label{sec:discussion}
+
+\subsection{Vergelijking met de baselines}
+
+De grote sprong tussen heuristiek ($21\%$ succes) en RL
+($95$--$100\%$) onderstreept waarom RL de juiste paradigmakeuze is voor
+Taxi: de heuristiek faalt niet omdat zijn optimaliseringscriterium
+verkeerd is, maar omdat zij een kritisch aspect van de omgeving (muren)
+niet expliciet modelleert. Een rijkere heuristiek met muur\-bewustzijn
+zou ongetwijfeld beter presteren --- maar zou ook handmatig
+voor elk nieuw raster opnieuw geprogrammeerd moeten worden, terwijl
+Q-learning en SARSA dezelfde implementatie kunnen toepassen op iedere
+discrete MDP. Dit illustreert de generaliseerbaarheid die RL
+fundamenteel onderscheidt van rule-based en supervised methoden
+\cite{sutton_barto_2018}.
+
+\subsection{Q-learning versus SARSA in dit domein}
+
+Op een omgeving als Cliff Walking
+\citep[Voorbeeld 6.6]{sutton_barto_2018} ontstaat een dramatisch
+verschil tussen on-policy en off-policy leren omdat de optimale policy
+direct langs een gevaarlijke afgrond loopt. Op Taxi-v3 ontbreekt zo'n
+``risico-randvoorwaarde''; de optimale policy is unimodaal en SARSA en
+Q-learning convergeren beide naar (vrijwel) dezelfde policy. Het
+overgebleven verschil --- $5\%$ minder succes voor SARSA en een
+gevoeligere $\alpha$-respons --- is precies wat de theorie voorspelt:
+SARSA's on-policy bootstrap incorporeert exploratie-ruis in $Q$, wat
+bij hoge $\alpha$ en hoge $\varepsilon$ destabiliseert.
+
+\subsection{Hyperparameter-bevindingen}
+
+Drie inzichten zijn relevant voor toekomstige toepassingen:
+
+\begin{enumerate}
+  \item \textbf{Q-learning is robuust voor $\alpha$ en $\gamma$.}
+        In een tabulaire setting met een eindige toestandsruimte
+        levert elke redelijke combinatie convergentie naar de optimale
+        Q-functie. Hyperparameter-tuning van deze twee is dus weinig
+        rendabel.
+  \item \textbf{$\varepsilon$-decay is wel kritisch.} Een te
+        traag schema houdt de gedragspolitiek te lang random;
+        evaluaties tijdens training reflecteren dan eerder de
+        gedragspolitiek dan de geleerde policy.
+  \item \textbf{Algoritme $\times$ hyperparameter is geen
+        productruimte.} Een waarde die voor Q-learning veilig is
+        ($\alpha=0{,}9$) is voor SARSA destructief. Tuning moet per
+        algoritme gebeuren.
+\end{enumerate}
+
+\subsection{Beperkingen}
+
+\paragraph{Schaal.} Tabulaire methoden vereisen \'e\'en
+$Q(s,a)$-cel per staat-actie-paar. Voor Taxi-v3 ($500 \times 6 = 3000$
+cellen) is dit triviaal, maar in elke realistische omgeving met
+continue of hoog-dimensionale toestanden onhaalbaar. De volgende stap
+is functie-approximatie via neurale netwerken (Deep Q-Networks,
+\cite{mnih_2015}), waar dezelfde Bellman-update wordt toegepast op de
+gradient van een neuraal netwerk in plaats van een tabel.
+
+\paragraph{Stochasticiteit.} Taxi-v3 is een deterministische
+omgeving: elke actie heeft een vast effect. Toevoeging van stochastische
+overgangen (zoals de \texttt{is\_slippery}-modus van CliffWalking) zou
+de Q-learning vs SARSA contrast verder kunnen versterken en is een
+natuurlijke uitbreiding voor vervolgwerk.
+
+\paragraph{Sample-effici\"entie.} Beide algoritmen vereisen rond de
+2000 episodes voor convergentie. Methoden zoals Dyna-Q
+\citep[\S 8.2]{sutton_barto_2018} kunnen dit verlagen door
+ervaringen te ``replayen'' in een geleerd omgevingsmodel.
+
+\section{Conclusie}
+
+We hebben Q-learning en SARSA vanaf nul ge\"implementeerd en toegepast op
+de Taxi-v3 omgeving. Q-learning bereikt $100\%$ greedy-succes met een
+gemiddelde episode-lengte dichtbij het theoretisch minimum; SARSA komt
+op $95\%$. Beide algoritmen verslaan zowel een uniform-random baseline
+als een muur-onbewuste Manhattan-shortest-path heuristiek met
+ordegrootten. Hyperparameter-sweeps met meerdere seeds tonen aan dat
+Q-learning robuust is voor $\alpha$ en $\gamma$ maar gevoelig voor te
+trage $\varepsilon$-decay, terwijl SARSA dramatisch instort bij hoge
+$\alpha$ --- in lijn met de theoretische voorspelling dat de on-policy
+bootstrap exploratie-ruis incorporeert in de waardeschatting.
+
+De gekozen omgeving en aanpak hebben ons in staat gesteld de centrale
+RL-concepten (Markov Decision Process, beloningen, $\varepsilon$-greedy
+exploratie, on-policy versus off-policy bootstrap, hyperparameter-
+gevoeligheid) op een werkende implementatie te demonstreren, terwijl
+de tabulaire schaal van $|S| \cdot |A| = 3000$ tegelijk laat zien
+waarom function-approximation methoden zoals DQN nodig zijn voor grotere
+problemen.
+
+\section*{Reproduceerbaarheid}
+
+Alle code, configuraties en getrainde Q-tabellen zijn beschikbaar in de
+projectrepository. Trainingen worden gestuurd via YAML-configuraties in
+\texttt{experiments/}; resultaten worden per run weggeschreven naar
+\texttt{results/<run\_name>/log.csv}. Elke commando-regelaanroep
+accepteert \texttt{--seed} voor reproduceerbaarheid; de figuren in dit
+rapport zijn gegenereerd door de scripts \texttt{src/plot\_results.py},
+\texttt{src/plot\_policy.py} en \texttt{src/plot\_sweep.py}. De volledige
+verzameling sweeps is reproduceerbaar met:
+
+\begin{verbatim}
+python -m src.sweep --agent qlearning --param alpha \
+    --values 0.1 0.3 0.5 0.9 --seeds 5 --episodes 3000
+python -m src.sweep --agent qlearning --param gamma \
+    --values 0.8 0.9 0.95 0.99 --seeds 5 --episodes 3000
+python -m src.sweep --agent qlearning --param epsilon_decay_episodes \
+    --values 200 1000 2000 5000 --seeds 5 --episodes 3000
+python -m src.sweep --agent sarsa --param alpha \
+    --values 0.1 0.3 0.5 0.9 --seeds 5 --episodes 3000
+\end{verbatim}
+
+\section*{Gebruik van Generative AI}
+
+Bij het schrijven van deze rapportage en de implementatie is gebruik
+gemaakt van Anthropic's Claude (model claude-opus-4-7, mei 2026) voor
+sparring over de structuur van het rapport, debugging van de
+trainings\-pipeline en het opstellen van de LaTeX-skelet. Alle
+algoritmische beslissingen, hyperparameter-keuzes en interpretaties
+zijn door de auteurs geverifieerd tegen de geciteerde bronnen.
+
+\begin{thebibliography}{9}
+
+\bibitem{sutton_barto_2018}
+Sutton, R.~S., \& Barto, A.~G. (2018).
+\emph{Reinforcement Learning: An Introduction} (2nd ed.).
+MIT Press.
+
+\bibitem{watkins_dayan_1992}
+Watkins, C.~J.~C.~H., \& Dayan, P. (1992).
+Q-learning.
+\emph{Machine Learning}, 8(3--4), 279--292.
+\url{https://doi.org/10.1007/BF00992698}
+
+\bibitem{rummery_niranjan_1994}
+Rummery, G.~A., \& Niranjan, M. (1994).
+\emph{On-line Q-learning using connectionist systems}
+(Technical Report CUED/F-INFENG/TR 166).
+University of Cambridge, Department of Engineering.
+
+\bibitem{dietterich_2000}
+Dietterich, T.~G. (2000).
+Hierarchical reinforcement learning with the MAXQ value function decomposition.
+\emph{Journal of Artificial Intelligence Research}, 13, 227--303.
+\url{https://doi.org/10.1613/jair.639}
+
+\bibitem{towers_2024}
+Towers, M., Kwiatkowski, A., Terry, J., et al. (2024).
+Gymnasium: A standard interface for reinforcement learning environments.
+\emph{arXiv:2407.17032}.
+\url{https://arxiv.org/abs/2407.17032}
+
+\bibitem{mnih_2015}
+Mnih, V., Kavukcuoglu, K., Silver, D., et al. (2015).
+Human-level control through deep reinforcement learning.
+\emph{Nature}, 518(7540), 529--533.
+\url{https://doi.org/10.1038/nature14236}
+
+\end{thebibliography}
+
+\end{document}

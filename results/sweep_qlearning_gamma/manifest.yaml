@@ -1,0 +1,16 @@
+agent: qlearning
+base_agent_cfg:
+  alpha: 0.5
+  epsilon_decay_episodes: 2000
+  epsilon_end: 0.05
+  epsilon_start: 1.0
+  gamma: 0.99
+config: experiments/qlearning_default.yaml
+episodes: 3000
+param: gamma
+seeds: 5
+values:
+- 0.8
+- 0.9
+- 0.95
+- 0.99

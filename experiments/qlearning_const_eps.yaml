@@ -1,0 +1,7 @@
+# Q-learning with constant low epsilon, for exploration-sensitivity study.
+agent:
+  alpha: 0.5
+  gamma: 0.99
+  epsilon_start: 0.1
+  epsilon_end: 0.1
+  epsilon_decay_episodes: 1
